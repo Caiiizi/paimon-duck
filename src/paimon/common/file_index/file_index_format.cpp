@@ -184,7 +184,6 @@ class FileIndexFormatWriterImpl : public FileIndexFormat::Writer {
         for (const auto& entry : entries) {
             ::ArrowArray tmp_array{};
             PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportArray(*batch, &tmp_array));
-            ScopeGuard tmp_guard([&tmp_array]() { ArrowArrayRelease(&tmp_array); });
             PAIMON_RETURN_NOT_OK(entry.writer->AddBatch(&tmp_array));
         }
 

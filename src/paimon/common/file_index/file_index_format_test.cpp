@@ -19,12 +19,14 @@
 
 #include "arrow/array/array_nested.h"
 #include "arrow/array/builder_primitive.h"
+#include "arrow/c/bridge.h"
 #include "arrow/c/helpers.h"
 #include "gtest/gtest.h"
 #include "paimon/common/file_index/bitmap/bitmap_file_index.h"
 #include "paimon/common/file_index/bloomfilter/bloom_filter_file_index.h"
 #include "paimon/common/file_index/bsi/bit_slice_index_bitmap_file_index.h"
 #include "paimon/common/file_index/empty/empty_file_index_reader.h"
+#include "paimon/common/file_index/rangebitmap/range_bitmap_file_index.h"
 #include "paimon/data/timestamp.h"
 #include "paimon/defs.h"
 #include "paimon/file_index/file_index_result.h"
@@ -54,6 +56,56 @@ class FileIndexFormatTest : public ::testing::Test {
 
  private:
     std::shared_ptr<MemoryPool> pool_;
+};
+
+class ZeroBodyWriter : public FileIndexWriter {
+ public:
+    ZeroBodyWriter(MemoryPool* pool, std::shared_ptr<arrow::DataType> struct_type)
+        : pool_(pool), struct_type_(std::move(struct_type)) {}
+
+    Status AddBatch(::ArrowArray* batch) override {
+        PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(auto array, arrow::ImportArray(batch, struct_type_));
+        ++add_batch_calls_;
+        return Status::OK();
+    }
+
+    Result<PAIMON_UNIQUE_PTR<Bytes>> SerializedBytes() const override {
+        return Bytes::AllocateBytes(0, pool_);
+    }
+
+    int add_batch_calls() const {
+        return add_batch_calls_;
+    }
+
+ private:
+    MemoryPool* pool_;
+    std::shared_ptr<arrow::DataType> struct_type_;
+    int add_batch_calls_ = 0;
+};
+
+class FailingAddBatchWriter : public FileIndexWriter {
+ public:
+    FailingAddBatchWriter(MemoryPool* pool, std::shared_ptr<arrow::DataType> struct_type)
+        : pool_(pool), struct_type_(std::move(struct_type)) {}
+
+    Status AddBatch(::ArrowArray* batch) override {
+        PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(auto array, arrow::ImportArray(batch, struct_type_));
+        ++add_batch_calls_;
+        return Status::Invalid("injected failure for AddBatch test");
+    }
+
+    Result<PAIMON_UNIQUE_PTR<Bytes>> SerializedBytes() const override {
+        return Bytes::AllocateBytes(0, pool_);
+    }
+
+    int add_batch_calls() const {
+        return add_batch_calls_;
+    }
+
+ private:
+    MemoryPool* pool_;
+    std::shared_ptr<arrow::DataType> struct_type_;
+    int add_batch_calls_ = 0;
 };
 
 TEST_F(FileIndexFormatTest, TestCreateEmptyFileIndexReader) {
@@ -963,6 +1015,22 @@ static void RegisterBitmapWriter(FileIndexFormat::Writer* writer, const std::str
                            arrow::struct_({col_field}));
 }
 
+// Helper: register a range-bitmap sub-writer (same schema pattern as RegisterBitmapWriter).
+static void RegisterRangeBitmapWriter(FileIndexFormat::Writer* writer, const std::string& col_name,
+                                      const std::shared_ptr<arrow::DataType>& arrow_type,
+                                      const std::shared_ptr<MemoryPool>& pool,
+                                      const std::string& index_type = "range-bitmap") {
+    auto col_field = arrow::field(col_name, arrow_type);
+    auto field_schema = arrow::schema({col_field});
+    ArrowSchema c_schema;
+    ASSERT_TRUE(arrow::ExportSchema(*field_schema, &c_schema).ok());
+
+    RangeBitmapFileIndex range_indexer({});
+    ASSERT_OK_AND_ASSIGN(auto sub_writer, range_indexer.CreateWriter(&c_schema, pool));
+    writer->AddIndexWriter(col_name, index_type, std::move(sub_writer),
+                           arrow::struct_({col_field}));
+}
+
 // Helper: build a single-column int32 struct and call writer->AddBatch.
 static void AddInt32Batch(FileIndexFormat::Writer* writer, const std::string& col_name,
                           const std::vector<int32_t>& values, const std::vector<bool>& validity) {
@@ -1318,38 +1386,14 @@ TEST_F(FileIndexFormatTest, TestWriterNotEqualInNotIn) {
 }
 
 TEST_F(FileIndexFormatTest, TestWriterMultipleIndexTypesPerColumn) {
-    class CountingZeroBodyWriter : public FileIndexWriter {
-     public:
-        explicit CountingZeroBodyWriter(MemoryPool* pool) : pool_(pool) {}
-
-        Status AddBatch(::ArrowArray* /*batch*/) override {
-            ++add_batch_calls_;
-            return Status::OK();
-        }
-
-        Result<PAIMON_UNIQUE_PTR<Bytes>> SerializedBytes() const override {
-            return Bytes::AllocateBytes(0, pool_);
-        }
-
-        int add_batch_calls() const {
-            return add_batch_calls_;
-        }
-
-     private:
-        MemoryPool* pool_;
-        int add_batch_calls_ = 0;
-    };
+    auto writer = FileIndexFormat::CreateWriter();
 
     // Same column "c" registered with two index types:
-    //   - bitmap: regular bitmap reader
-    //   - empty-index-test: zero-body writer (EMPTY_INDEX_FLAG -> EmptyFileIndexReader)
-    // This verifies that multi-writer AddBatch fan-out works and both entries are readable.
-    auto writer = FileIndexFormat::CreateWriter();
+    //   - bitmap: BitmapFileIndex
+    //   - range-bitmap: RangeBitmapFileIndex (factory id "range-bitmap")
+    // Verifies multi-writer AddBatch fan-out and round-trip for both readers.
     RegisterBitmapWriter(writer.get(), "c", arrow::int32(), pool_, "bitmap");
-    auto c_field = arrow::field("c", arrow::int32());
-    auto counting_empty_writer = std::make_shared<CountingZeroBodyWriter>(pool_.get());
-    writer->AddIndexWriter("c", "empty-index-test", counting_empty_writer,
-                           arrow::struct_({c_field}));
+    RegisterRangeBitmapWriter(writer.get(), "c", arrow::int32(), pool_);
 
     // Also register a second column to test cross-column correctness.
     RegisterBitmapWriter(writer.get(), "d", arrow::int32(), pool_);
@@ -1358,7 +1402,6 @@ TEST_F(FileIndexFormatTest, TestWriterMultipleIndexTypesPerColumn) {
     AddInt32Batch(writer.get(), "c", {1, 2, 1, 0}, {true, true, true, false});
     // Feed data to column "d": [10, 20] (2 rows)
     AddInt32Batch(writer.get(), "d", {10, 20}, {true, true});
-    ASSERT_EQ(1, counting_empty_writer->add_batch_calls());
 
     ASSERT_OK_AND_ASSIGN(auto bytes, writer->Serialize(pool_));
     auto input_stream = std::make_shared<ByteArrayInputStream>(bytes->data(), bytes->size());
@@ -1367,39 +1410,42 @@ TEST_F(FileIndexFormatTest, TestWriterMultipleIndexTypesPerColumn) {
     auto schema =
         arrow::schema({arrow::field("c", arrow::int32()), arrow::field("d", arrow::int32())});
 
-    // Column "c" should have 2 readers:
-    //   - bitmap reader with expected filtering semantics
-    //   - empty reader from EMPTY_INDEX_FLAG entry
+    // Column "c" should have 2 readers: bitmap + range-bitmap, same semantics for int32 data.
+    auto assert_c_int32_index = [](FileIndexReader* idx) {
+        {
+            ASSERT_OK_AND_ASSIGN(auto result, idx->VisitEqual(Literal(1)));
+            ASSERT_EQ("{0,2}", result->ToString());
+        }
+        {
+            ASSERT_OK_AND_ASSIGN(auto result, idx->VisitEqual(Literal(2)));
+            ASSERT_EQ("{1}", result->ToString());
+        }
+        {
+            ASSERT_OK_AND_ASSIGN(auto result, idx->VisitIsNull());
+            ASSERT_EQ("{3}", result->ToString());
+        }
+    };
     {
         ASSERT_OK_AND_ASSIGN(auto readers,
                              reader->ReadColumnIndex("c", CreateArrowSchema(schema).get()));
         ASSERT_EQ(2, readers.size());
 
         int bitmap_readers = 0;
-        int empty_readers = 0;
+        int range_bitmap_readers = 0;
         for (const auto& r : readers) {
             if (auto* bm = dynamic_cast<BitmapFileIndexReader*>(r.get())) {
                 ++bitmap_readers;
-                {
-                    ASSERT_OK_AND_ASSIGN(auto result, bm->VisitEqual(Literal(1)));
-                    ASSERT_EQ("{0,2}", result->ToString());
-                }
-                {
-                    ASSERT_OK_AND_ASSIGN(auto result, bm->VisitEqual(Literal(2)));
-                    ASSERT_EQ("{1}", result->ToString());
-                }
-                {
-                    ASSERT_OK_AND_ASSIGN(auto result, bm->VisitIsNull());
-                    ASSERT_EQ("{3}", result->ToString());
-                }
+                assert_c_int32_index(bm);
                 continue;
             }
-            if (dynamic_cast<EmptyFileIndexReader*>(r.get())) {
-                ++empty_readers;
+            if (auto* rbm = dynamic_cast<RangeBitmapFileIndexReader*>(r.get())) {
+                ++range_bitmap_readers;
+                assert_c_int32_index(rbm);
+                continue;
             }
         }
         ASSERT_EQ(1, bitmap_readers);
-        ASSERT_EQ(1, empty_readers);
+        ASSERT_EQ(1, range_bitmap_readers);
     }
 
     // Column "d" should have 1 reader.
@@ -1420,47 +1466,16 @@ TEST_F(FileIndexFormatTest, TestWriterMultipleIndexTypesPerColumn) {
     }
 }
 
-// ZeroBodyWriter: returns 0 bytes from SerializedBytes() to trigger EMPTY_INDEX_FLAG.
-class ZeroBodyWriter : public FileIndexWriter {
- public:
-    explicit ZeroBodyWriter(MemoryPool* pool) : pool_(pool) {}
-    Status AddBatch(::ArrowArray* /*batch*/) override {
-        return Status::OK();
-    }
-    Result<PAIMON_UNIQUE_PTR<Bytes>> SerializedBytes() const override {
-        return Bytes::AllocateBytes(0, pool_);
-    }
-
- private:
-    MemoryPool* pool_;
-};
-
-// FailingAddBatchWriter: AddBatch returns error. Must release batch when rejecting.
-class FailingAddBatchWriter : public FileIndexWriter {
- public:
-    explicit FailingAddBatchWriter(MemoryPool* pool) : pool_(pool) {}
-    Status AddBatch(::ArrowArray* batch) override {
-        ArrowArrayRelease(batch);
-        return Status::Invalid("injected failure for memory test");
-    }
-    Result<PAIMON_UNIQUE_PTR<Bytes>> SerializedBytes() const override {
-        return Bytes::AllocateBytes(0, pool_);
-    }
-
- private:
-    MemoryPool* pool_;
-};
-
-TEST_F(FileIndexFormatTest, TestWriterAddBatchMultiWriterFailureReleasesResources) {
-    // Column "c" has two sub-writers: first succeeds, second fails.
-    // Verifies tmp_array and original batch are properly released on failure path.
+TEST_F(FileIndexFormatTest, TestWriterAddBatchMultiWriterFailurePropagatesError) {
     auto writer = FileIndexFormat::CreateWriter();
     auto c_field = arrow::field("c", arrow::int32());
+    auto c_struct_type = arrow::struct_({c_field});
 
-    writer->AddIndexWriter("c", "ok", std::make_shared<ZeroBodyWriter>(pool_.get()),
-                           arrow::struct_({c_field}));
-    writer->AddIndexWriter("c", "fail", std::make_shared<FailingAddBatchWriter>(pool_.get()),
-                           arrow::struct_({c_field}));
+    auto ok_writer = std::make_shared<ZeroBodyWriter>(pool_.get(), c_struct_type);
+    auto fail_writer = std::make_shared<FailingAddBatchWriter>(pool_.get(), c_struct_type);
+
+    ASSERT_TRUE(writer->AddIndexWriter("c", "ok", ok_writer, c_struct_type).ok());
+    ASSERT_TRUE(writer->AddIndexWriter("c", "fail", fail_writer, c_struct_type).ok());
 
     arrow::Int32Builder builder;
     ASSERT_TRUE(builder.AppendValues({1, 2, 3}, {true, true, true}).ok());
@@ -1471,6 +1486,11 @@ TEST_F(FileIndexFormatTest, TestWriterAddBatchMultiWriterFailureReleasesResource
     Status st = writer->AddBatch("c", struct_arr);
     ASSERT_FALSE(st.ok());
     ASSERT_TRUE(st.ToString().find("injected failure") != std::string::npos);
+
+    // The first writer should have been called successfully.
+    ASSERT_EQ(1, ok_writer->add_batch_calls());
+    // The failing writer should also have been called once.
+    ASSERT_EQ(1, fail_writer->add_batch_calls());
 }
 
 TEST_F(FileIndexFormatTest, TestWriterEmptyIndexEntry) {
@@ -1478,8 +1498,16 @@ TEST_F(FileIndexFormatTest, TestWriterEmptyIndexEntry) {
     // Verifies that EMPTY_INDEX_FLAG is written and read back as EmptyFileIndexReader.
     auto writer = FileIndexFormat::CreateWriter();
 
+    auto col1_field = arrow::field("col1", arrow::int32());
+    auto col1_struct_type = arrow::struct_({col1_field});
+
     // col1: zero-body writer, type "zero" (4 chars)
-    writer->AddIndexWriter("col1", "zero", std::make_shared<ZeroBodyWriter>(pool_.get()), nullptr);
+    ASSERT_TRUE(
+        writer
+            ->AddIndexWriter("col1", "zero",
+                             std::make_shared<ZeroBodyWriter>(pool_.get(), col1_struct_type),
+                             col1_struct_type)
+            .ok());
 
     // col2: normal bitmap writer
     RegisterBitmapWriter(writer.get(), "col2", arrow::int32(), pool_);
